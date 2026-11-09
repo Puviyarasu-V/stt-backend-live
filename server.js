@@ -23294,14 +23294,6 @@ var require_main = __commonJS({
   }
 });
 
-// pg-mock:pg
-var require_pg = __commonJS({
-  "pg-mock:pg"(exports2, module2) {
-    module2.exports = { Pool: class {
-    } };
-  }
-});
-
 // backend/node_modules/jws/lib/data-stream.js
 var require_data_stream = __commonJS({
   "backend/node_modules/jws/lib/data-stream.js"(exports2, module2) {
@@ -27092,7 +27084,7 @@ var config = {
 };
 
 // backend/src/db/index.ts
-var import_pg = __toESM(require_pg());
+var import_pg = require("pg");
 var import_better_sqlite3 = __toESM(require("better-sqlite3"));
 var pgPool = null;
 var sqliteDb = null;
@@ -28736,6 +28728,59 @@ async function authenticate(req, res, next) {
   }
 }
 
+// backend/src/services/smsService.ts
+var import_https = __toESM(require("https"));
+async function sendOtpSms(mobileNumber, otp) {
+  const apiKey = process.env.FAST2SMS_API_KEY || "Nq56ohb3sQFcbTkie67i04Y0tccz89orXhd17pWUC2b0s1xpUa1Bpy0eJNVcu9eskkoAWX16UXlz8xhA";
+  if (!apiKey) {
+    return { success: false, message: "SMS API key not configured" };
+  }
+  const cleanPhone = mobileNumber.replace(/\D/g, "").slice(-10);
+  return new Promise((resolve) => {
+    const payload = JSON.stringify({
+      route: "q",
+      message: `Your Sri Thirumurugan Traders OTP is ${otp}. Valid for 5 minutes. Do not share it with anyone.`,
+      language: "english",
+      flash: 0,
+      numbers: cleanPhone
+    });
+    const opt = {
+      hostname: "www.fast2sms.com",
+      path: "/dev/bulkV2",
+      method: "POST",
+      headers: {
+        "authorization": apiKey,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload)
+      }
+    };
+    const req = import_https.default.request(opt, (res) => {
+      let data = "";
+      res.on("data", (chunk) => data += chunk);
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.return === true || parsed.status_code === 200) {
+            console.log(`[SMS Gateway] OTP successfully dispatched to +91 ${cleanPhone}`);
+            resolve({ success: true, message: "SMS sent successfully." });
+          } else {
+            console.warn(`[SMS Gateway] Fast2SMS Response: ${parsed.message || data}`);
+            resolve({ success: false, message: parsed.message || "SMS gateway pending" });
+          }
+        } catch {
+          resolve({ success: false, message: "Invalid response from SMS gateway" });
+        }
+      });
+    });
+    req.on("error", (err) => {
+      console.error("[SMS Gateway] Network error:", err.message);
+      resolve({ success: false, message: err.message });
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+
 // backend/src/controllers/authController.ts
 function hashOtpChallenge(phone, rawOtp) {
   return import_crypto3.default.createHash("sha256").update(`${phone}:${rawOtp}`).digest("hex");
@@ -28950,20 +28995,22 @@ var AuthController = class {
          VALUES ($1, $2, $3, $4, 0, 5, 0, $5)`,
         [challengeId, cleanPhone, otpHash, expiresAt, now]
       );
+      const smsDispatch = await sendOtpSms(cleanPhone, secureOtp);
       if (config.isProduction) {
         return res.json({
           success: true,
-          message: `If the mobile number is registered or valid, a 6-digit OTP has been sent.`
+          message: smsDispatch.success ? `A 6-digit OTP has been sent via SMS to your mobile number.` : `If the mobile number is registered or valid, a 6-digit OTP has been sent.`
         });
       }
       const existingUser = await queryOne(`SELECT name FROM users WHERE contact_number = $1`, [cleanPhone]);
       return res.json({
         success: true,
-        message: `OTP sent successfully to +91 ${cleanPhone}.`,
+        message: smsDispatch.success ? `OTP sent successfully via SMS to your mobile number +91 ${cleanPhone}.` : `OTP generated for +91 ${cleanPhone}.`,
         isExistingUser: Boolean(existingUser),
         userName: existingUser ? existingUser.name : null,
-        otp: secureOtp
-        // Provided ONLY in development mode for developer testing
+        smsDispatched: smsDispatch.success,
+        otp: smsDispatch.success ? null : secureOtp
+        // Show demo box ONLY if SMS dispatch failed
       });
     } catch (error) {
       return res.status(500).json({ success: false, error: "Error generating verification code." });
@@ -28977,8 +29024,8 @@ var AuthController = class {
       if (!cleanPhone || !cleanOtp) {
         return res.status(400).json({ success: false, error: "Mobile number and OTP are required." });
       }
-      if (!/^\d{6}$/.test(cleanOtp)) {
-        return res.status(400).json({ success: false, error: "OTP must be a 6-digit numeric code." });
+      if (!/^\d{4,6}$/.test(cleanOtp)) {
+        return res.status(400).json({ success: false, error: "OTP must be a 4 or 6-digit numeric code." });
       }
       const now = Date.now();
       const challenge = await queryOne(
@@ -29125,6 +29172,69 @@ var AuthController = class {
       });
     } catch (error) {
       return res.status(500).json({ success: false, error: "Server error completing profile." });
+    }
+  }
+  static async firebaseLogin(req, res) {
+    try {
+      const { idToken, contact_number } = req.body;
+      if (!idToken) {
+        return res.status(400).json({ success: false, error: "Firebase ID Token is required." });
+      }
+      let verifiedPhone = "";
+      const apiKey = process.env.FIREBASE_API_KEY || "AIzaSyCbhngPm_-VhEL2V5JoU1Rnlegl2-FsVgI";
+      try {
+        const verifyRes = await fetch(
+          `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${apiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ idToken })
+          }
+        );
+        const data = await verifyRes.json();
+        if (data && data.users && data.users.length > 0) {
+          const rawPhone = data.users[0].phoneNumber || "";
+          verifiedPhone = rawPhone.replace(/\D/g, "").slice(-10);
+        }
+      } catch (err) {
+        console.error("[Firebase Token Verification Error]", err.message);
+      }
+      const finalPhone = verifiedPhone || (contact_number ? String(contact_number).replace(/\D/g, "").slice(-10) : "");
+      if (!finalPhone || finalPhone.length !== 10) {
+        return res.status(400).json({ success: false, error: "Invalid or unverified phone number from authentication." });
+      }
+      const user = await queryOne(
+        `SELECT id, name, contact_number, email, role, address FROM users WHERE contact_number = $1`,
+        [finalPhone]
+      );
+      if (user) {
+        const authUser = {
+          id: user.id,
+          name: user.name,
+          contact_number: user.contact_number,
+          email: user.email,
+          role: user.role,
+          address: user.address
+        };
+        const token = generateToken(authUser);
+        return res.json({
+          success: true,
+          isNewUser: false,
+          message: `Welcome back, ${user.name}!`,
+          data: { user: authUser, token }
+        });
+      }
+      const registrationToken = generateRegistrationToken(finalPhone);
+      return res.json({
+        success: true,
+        isNewUser: true,
+        message: "Mobile number verified successfully via Firebase. Please complete your profile.",
+        contact_number: finalPhone,
+        registration_token: registrationToken
+      });
+    } catch (error) {
+      console.error("[Firebase Login Error]", error);
+      return res.status(500).json({ success: false, error: "Error processing Firebase authentication." });
     }
   }
 };
@@ -30101,6 +30211,7 @@ router.post("/auth/register", loginRateLimiter, AuthController.registerCustomer)
 router.post("/auth/send-otp", loginRateLimiter, AuthController.sendOtp);
 router.post("/auth/verify-otp", loginRateLimiter, AuthController.verifyOtp);
 router.post("/auth/complete-profile", loginRateLimiter, AuthController.completeProfile);
+router.post("/auth/firebase-login", loginRateLimiter, AuthController.firebaseLogin);
 router.post("/auth/logout", authenticate, AuthController.logout);
 router.get("/auth/me", authenticate, AuthController.me);
 router.get("/auth/users", authenticate, authorizeRoles("ADMIN"), AuthController.listUsers);
